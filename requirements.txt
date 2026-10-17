@@ -1,0 +1,12 @@
+# Direct dependencies, pinned to the versions used for local verification.
+fastapi==0.143.3
+google-genai==2.31.0
+httpx==0.28.1
+numpy==2.5.4
+opencv-python-headless==5.0.0.93
+Pillow==13.0.0
+pydantic==2.14.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+starlette==1.8.0
+uvicorn[standard]==0.54.0

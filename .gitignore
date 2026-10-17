@@ -1,0 +1,35 @@
+# Local credentials and environment overrides
+.env
+.env.*
+.env_*
+!.env_example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python environments and generated files
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local input images, screenshots, logs, and editor settings
+/images/
+/test/
+/swagger-upload-result.png
+logs/
+*.log
+*.jsonl
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
