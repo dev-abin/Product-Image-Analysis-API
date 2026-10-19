@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from time import perf_counter
@@ -12,6 +14,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 request_id_context: ContextVar[str | None] = ContextVar("request_id", default=None)
 VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
+LOG_FILE = Path(__file__).resolve().parent / "logs" / "app.log"
 
 
 class RequestContextFilter(logging.Filter):
@@ -32,12 +35,29 @@ class JsonFormatter(logging.Formatter):
             "event": record.getMessage(),
             "request_id": getattr(record, "request_id", request_id_context.get()),
         }
-        for field in ("method", "path", "status_code", "latency_ms"):
+        # Only explicitly approved fields become part of the persisted log.
+        for field in (
+            "method", "path", "status_code", "latency_ms", "stage",
+            "status", "reasons", "min_side", "sharpness", "attempt",
+            "model", "error_type", "provider_status", "size_bytes",
+        ):
             if hasattr(record, field):
                 data[field] = getattr(record, field)
         if record.exc_info:
             data["exception"] = self.formatException(record.exc_info)
         return json.dumps(data, ensure_ascii=False)
+
+
+def create_file_handler(
+    path: Path = LOG_FILE, max_bytes: int = 5 * 1024 * 1024, backup_count: int = 3,
+) -> RotatingFileHandler:
+    """Persist JSON logs, keeping the active file and three bounded backups."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8",
+    )
+    handler.setFormatter(JsonFormatter())
+    return handler
 
 
 logger = logging.getLogger("image_api")
@@ -48,6 +68,7 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
     logger.addHandler(handler)
+    logger.addHandler(create_file_handler())
 
 
 class RequestLoggingMiddleware:

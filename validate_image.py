@@ -1,15 +1,24 @@
 from io import BytesIO
+from time import perf_counter
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from request_logging import logger
+
 
 def validate_image(image_bytes: bytes) -> dict:
+    started = perf_counter()
+    logger.info("validation.started", extra={"stage": "validation"})
     try:
         with Image.open(BytesIO(image_bytes)) as uploaded:
             image = ImageOps.exif_transpose(uploaded).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError):
+        logger.info("validation.completed", extra={
+            "stage": "validation", "status": "fail", "reasons": ["invalid_image"],
+            "latency_ms": round((perf_counter() - started) * 1000, 3),
+        })
         return {
             "status": "fail",
             "reasons": ["invalid_image"],
@@ -33,6 +42,12 @@ def validate_image(image_bytes: bytes) -> dict:
     if sharpness_score < 50:
         reasons.append("blurry")
 
+    logger.info("validation.completed", extra={
+        "stage": "validation", "status": "fail" if reasons else "pass",
+        "reasons": reasons, "min_side": shorter_side,
+        "sharpness": round(sharpness_score, 2),
+        "latency_ms": round((perf_counter() - started) * 1000, 3),
+    })
     return {
         "status": "fail" if reasons else "pass",
         "reasons": reasons,

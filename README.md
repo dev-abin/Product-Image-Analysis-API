@@ -43,7 +43,7 @@ variables take precedence. Keep your real API key out of source control.
 
 Images that pass local validation are sent to Google's Gemini service. A valid
 key, network access, and available API quota are required for this step; API usage
-may incur charges. Health checks and logging unit tests don't call Gemini.
+may incur charges. Health checks and automated tests don't call Gemini.
 
 ## Run
 
@@ -143,8 +143,10 @@ Let Postman generate the multipart `Content-Type` header automatically.
 
 ## Logging
 
-Application logs are newline-delimited JSON written to the terminal (`stderr`).
-There is no log file or database configured. Each request log contains:
+Application logs are newline-delimited JSON written to the terminal (`stderr`)
+and persisted in `logs/app.log` beside the application. The directory is created
+automatically. Each file rotates at 5 MiB, retaining three backups (`app.log.1`
+through `app.log.3`). These files are excluded from Git. Each request log contains:
 
 ```json
 {
@@ -167,19 +169,48 @@ There is no log file or database configured. Each request log contains:
 - Server latency measures processing through response completion. Client latency
   includes additional connection and transfer overhead.
 - Application code can use `from request_logging import logger` to include the
-  active request ID in its logs. Unexpected exceptions include a traceback.
+  active request ID in its logs. `RequestContextFilter` attaches that ID to logs
+  from all stages. Unexpected request exceptions include a traceback.
+- Stage events cover uploads, validation scores and reasons, skipped Gemini
+  calls, provider attempts and retries, LLM duration, and the final business
+  verdict. `decision.completed` records `pass`, `fail`, or `needs_review`
+  separately from the HTTP status code in `request.completed`.
+- LLM errors record the failing stage and exception class, without the provider
+  exception message, raw model output, or image contents.
 - Request bodies, query strings, and headers are not included in request logs.
   Review logs and tracebacks before sharing them; errors can include local paths.
 - Uvicorn startup and diagnostic messages use its own console format.
 
+To follow persisted logs in PowerShell:
+
+```powershell
+Get-Content .\logs\app.log -Tail 20 -Wait
+```
+
+File rotation is intended for a single application process. For multiple worker
+processes or replicas, use console logs with a shared log collector instead of
+having workers rotate the same file.
+
 ## Run unit tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_request_logging -v
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Tests cover request IDs, latency, invalid IDs, query exclusion, HTTP 404 logging,
-and exception handling. They don't require an API key or call Gemini.
+To measure line and branch coverage for the application modules:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest --cov=main --cov=analyse_image --cov=validate_image --cov=schemas --cov=request_logging --cov-branch --cov-report=term-missing
+```
+
+Tests use generated images and mocked Gemini responses; no API key or external
+requests are required. Coverage includes image-quality thresholds, decoding and
+EXIF orientation, strict fact validation, decision-rule precedence, provider
+timeouts and retry limits, upload responses and file cleanup, request IDs,
+JSON logs, exception handling, and concurrent request-context isolation.
+These checks verify application behavior, not the real model's image accuracy
+or live provider connectivity.
 
 ## Repository contents
 
@@ -187,9 +218,12 @@ and exception handling. They don't require an API key or call Gemini.
 | --- | --- |
 | `main.py` | FastAPI routes and middleware wiring |
 | `validate_image.py` | Local resolution and blur checks |
-| `analyse_image.py` | Gemini prompt, output schema, and API error handling |
+| `analyse_image.py` | Gemini prompt, structured extraction, and API error handling |
+| `schemas.py` | Shared Pydantic facts, scores, and response models |
 | `request_logging.py` | JSON logging and request tracing middleware |
-| `test_request_logging.py` | Logging unit tests |
+| `tests/` | Pytest unit tests and upload-route checks |
+| `pytest.ini` | Test discovery and import configuration |
+| `requirements-dev.txt` | Application dependencies plus pytest and coverage tools |
 | `requirements.txt` | Direct dependencies pinned to the locally verified versions |
 | `.env_example` | Placeholder environment configuration |
 | `.gitignore` | Excludes local secrets, environments, images, logs, and generated files |

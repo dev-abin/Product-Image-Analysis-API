@@ -1,25 +1,11 @@
-from typing import Literal
-
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel
 
-from analyse_image import ProductAnalysis, analyze_image
-from request_logging import RequestLoggingMiddleware
+from analyse_image import analyze_image
+from request_logging import RequestLoggingMiddleware, logger
+from schemas import ProductAnalysis, UploadResponse
 from validate_image import validate_image
 
 app = FastAPI()
-
-
-class ImageScores(BaseModel):
-    min_side: int | None
-    sharpness: float | None
-
-
-class UploadResponse(BaseModel):
-    status: Literal["pass", "fail", "needs_review"]
-    reasons: list[str]
-    scores: ImageScores
-    facts: ProductAnalysis | None
 
 
 def decide(facts: ProductAnalysis | None) -> dict:
@@ -50,9 +36,14 @@ async def upload_image(
 ):
     try:
         image_bytes = await file.read()
+        logger.info("upload.received", extra={"stage": "upload", "size_bytes": len(image_bytes)})
         validation = validate_image(image_bytes)
 
         if validation["status"] == "fail":
+            logger.info("llm.skipped", extra={"stage": "llm", "reasons": validation["reasons"]})
+            logger.info("decision.completed", extra={
+                "stage": "decision", "status": "fail", "reasons": validation["reasons"],
+            })
             return {**validation, "facts": None}
 
         facts = analyze_image(
@@ -60,12 +51,17 @@ async def upload_image(
             file.content_type or "application/octet-stream",
         )
 
+        decision = decide(facts)
+        logger.info("decision.completed", extra={
+            "stage": "decision", "status": decision["status"], "reasons": decision["reasons"],
+        })
         return {
-            **decide(facts),
+            **decision,
             "scores": validation["scores"],
         }
 
     except ValueError as exc:
+        logger.warning("upload.invalid", extra={"stage": "upload", "error_type": type(exc).__name__})
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         await file.close()
