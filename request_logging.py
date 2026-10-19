@@ -1,11 +1,14 @@
 import json
 import logging
 import re
-from logging.handlers import RotatingFileHandler
+from copy import copy
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+from multiprocessing import get_context
 from pathlib import Path
+from queue import Full
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from time import perf_counter
+from time import monotonic, perf_counter
 from uuid import uuid4
 
 from starlette.datastructures import Headers, MutableHeaders
@@ -39,12 +42,14 @@ class JsonFormatter(logging.Formatter):
         for field in (
             "method", "path", "status_code", "latency_ms", "stage",
             "status", "reasons", "min_side", "sharpness", "attempt",
-            "model", "error_type", "provider_status", "size_bytes",
+            "model", "error_type", "provider_status", "size_bytes", "dropped_count",
         ):
             if hasattr(record, field):
                 data[field] = getattr(record, field)
         if record.exc_info:
             data["exception"] = self.formatException(record.exc_info)
+        elif record.exc_text:
+            data["exception"] = record.exc_text
         return json.dumps(data, ensure_ascii=False)
 
 
@@ -65,10 +70,105 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 if not logger.handlers:
     logger.addFilter(RequestContextFilter())
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-    logger.addHandler(handler)
-    logger.addHandler(create_file_handler())
+    # Output handlers belong to the app lifespan, never to module imports.
+    logger.addHandler(logging.NullHandler())
+
+
+class LogQueueHandler(QueueHandler):
+    def __init__(self, queue, dropped):
+        super().__init__(queue)
+        self.dropped = dropped
+
+    def prepare(self, record):
+        # Preserve exceptions as a separate JSON field and make them picklable.
+        prepared = copy(record)
+        prepared.msg = record.getMessage()
+        prepared.args = None
+        if record.exc_info:
+            prepared.exc_text = logging.Formatter().formatException(record.exc_info)
+        prepared.exc_info = None
+        return prepared
+
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except Full:
+            # No synchronous stderr fallback on a request-processing thread.
+            with self.dropped.get_lock():
+                self.dropped.value += 1
+
+
+class LogQueueListener(QueueListener):
+    def __init__(self, queue, dropped, *handlers):
+        super().__init__(queue, *handlers, respect_handler_level=True)
+        self.dropped = dropped
+        self._reported = 0
+        self._last_report = 0.0
+
+    def report_drops(self, force=False):
+        total = self.dropped.value
+        if total > self._reported and (force or monotonic() - self._last_report >= 5):
+            record = logging.makeLogRecord({
+                "name": "image_api", "levelno": logging.WARNING, "levelname": "WARNING",
+                "msg": "logging.dropped", "request_id": None,
+                "dropped_count": total - self._reported,
+            })
+            # Write directly from the listener; don't enqueue a new warning.
+            super().handle(record)
+            self._reported = total
+            self._last_report = monotonic()
+
+    def handle(self, record):
+        super().handle(record)
+        self.report_drops()
+
+    def enqueue_sentinel(self):
+        # stop() runs off the event loop; wait for room if the queue is full.
+        self.queue.put(self._sentinel)
+
+    def stop(self):
+        super().stop()
+        self.report_drops(force=True)
+
+
+def start_queue_logging(capacity=1000, handlers=None):
+    """Start one bounded queue/listener shared by the API and CPU workers."""
+    if capacity < 1:
+        raise ValueError("Log queue capacity must be positive")
+    if getattr(logger, "queue_runtime", None) is not None:
+        raise RuntimeError("Queue logging is already running")
+    previous = logger.handlers[:]
+    owned = []
+    if handlers is None:
+        console = logging.StreamHandler()
+        console.setFormatter(JsonFormatter())
+        owned = [console, create_file_handler()]
+        handlers = owned + [h for h in previous if not isinstance(h, logging.NullHandler)]
+    context = get_context("spawn")
+    queue = context.Queue(maxsize=capacity)
+    dropped = context.Value("Q", 0)
+    handler = LogQueueHandler(queue, dropped)
+    listener = LogQueueListener(queue, dropped, *handlers)
+    runtime = {"queue": queue, "dropped": dropped, "listener": listener,
+               "handler": handler, "previous": previous, "owned": owned}
+    listener.start()
+    logger.handlers = [handler]
+    logger.queue_runtime = runtime
+    return runtime
+
+
+def stop_queue_logging(runtime):
+    """Stop producers first, drain accepted records, then close output files."""
+    logger.handlers = runtime["previous"]
+    try:
+        runtime["listener"].stop()
+    finally:
+        for handler in runtime["owned"]:
+            handler.close()
+        runtime["handler"].close()
+        runtime["queue"].close()
+        runtime["queue"].join_thread()
+        logger.queue_runtime = None
 
 
 class RequestLoggingMiddleware:
