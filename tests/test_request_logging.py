@@ -5,7 +5,6 @@ import pickle
 import sys
 import threading
 from queue import Queue
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
@@ -235,7 +234,7 @@ def test_queue_preserves_exception_as_json_field_without_mutating_record():
         raise RuntimeError("test traceback")
     except RuntimeError:
         record = logging.makeLogRecord({"msg": "request.failed", "exc_info": sys.exc_info()})
-    handler = LogQueueHandler(Queue(), None)
+    handler = LogQueueHandler(Queue())
     prepared = pickle.loads(pickle.dumps(handler.prepare(record)))
     assert prepared.msg == "request.failed"
     assert prepared.exc_info is None
@@ -243,15 +242,14 @@ def test_queue_preserves_exception_as_json_field_without_mutating_record():
     assert "RuntimeError: test traceback" in json.loads(JsonFormatter().format(prepared))["exception"]
 
 
-def test_queue_overflow_counts_drops_without_stderr_fallback(capsys):
-    lock = threading.Lock()
-    dropped = SimpleNamespace(value=0, get_lock=lambda: lock)
+def test_queue_overflow_drops_silently_without_stderr_fallback(capsys):
     queue = Queue(maxsize=1)
-    handler = LogQueueHandler(queue, dropped)
+    handler = LogQueueHandler(queue)
     handler.handle(logging.makeLogRecord({"msg": "accepted"}))
     handler.handle(logging.makeLogRecord({"msg": "dropped"}))
+    handler.handle(logging.makeLogRecord({"msg": "dropped error", "levelno": logging.ERROR}))
     assert queue.qsize() == 1
-    assert dropped.value == 1
+    assert queue.get_nowait().msg == "accepted"
     assert capsys.readouterr().err == ""
 
 
@@ -277,13 +275,11 @@ def test_slow_output_does_not_block_event_loop_and_full_queue_drains():
             logger.info("queued")
             logger.info("overflow.1")
             logger.info("overflow.2")
-            assert runtime["dropped"].value == 2
             assert all(t != event_loop_thread for t in thread_ids)
         finally:
             release.set()
             await asyncio.to_thread(stop_queue_logging, runtime)
-        assert [r.msg for r in records if r.msg != "logging.dropped"] == ["first", "queued"]
-        assert sum(r.dropped_count for r in records if r.msg == "logging.dropped") == 2
+        assert [r.msg for r in records] == ["first", "queued"]
         assert runtime["listener"]._thread is None
 
     asyncio.run(run())

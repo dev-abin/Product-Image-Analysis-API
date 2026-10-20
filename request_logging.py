@@ -8,7 +8,7 @@ from pathlib import Path
 from queue import Full
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from time import monotonic, perf_counter
+from time import perf_counter
 from uuid import uuid4
 
 from starlette.datastructures import Headers, MutableHeaders
@@ -42,7 +42,7 @@ class JsonFormatter(logging.Formatter):
         for field in (
             "method", "path", "status_code", "latency_ms", "stage",
             "status", "reasons", "min_side", "sharpness", "attempt",
-            "model", "error_type", "provider_status", "size_bytes", "dropped_count",
+            "model", "error_type", "provider_status", "size_bytes",
         ):
             if hasattr(record, field):
                 data[field] = getattr(record, field)
@@ -75,10 +75,6 @@ if not logger.handlers:
 
 
 class LogQueueHandler(QueueHandler):
-    def __init__(self, queue, dropped):
-        super().__init__(queue)
-        self.dropped = dropped
-
     def prepare(self, record):
         # Preserve exceptions as a separate JSON field and make them picklable.
         prepared = copy(record)
@@ -93,42 +89,14 @@ class LogQueueHandler(QueueHandler):
         try:
             self.queue.put_nowait(record)
         except Full:
-            # No synchronous stderr fallback on a request-processing thread.
-            with self.dropped.get_lock():
-                self.dropped.value += 1
+            # Drop silently instead of blocking or falling back to stderr.
+            pass
 
 
 class LogQueueListener(QueueListener):
-    def __init__(self, queue, dropped, *handlers):
-        super().__init__(queue, *handlers, respect_handler_level=True)
-        self.dropped = dropped
-        self._reported = 0
-        self._last_report = 0.0
-
-    def report_drops(self, force=False):
-        total = self.dropped.value
-        if total > self._reported and (force or monotonic() - self._last_report >= 5):
-            record = logging.makeLogRecord({
-                "name": "image_api", "levelno": logging.WARNING, "levelname": "WARNING",
-                "msg": "logging.dropped", "request_id": None,
-                "dropped_count": total - self._reported,
-            })
-            # Write directly from the listener; don't enqueue a new warning.
-            super().handle(record)
-            self._reported = total
-            self._last_report = monotonic()
-
-    def handle(self, record):
-        super().handle(record)
-        self.report_drops()
-
     def enqueue_sentinel(self):
         # stop() runs off the event loop; wait for room if the queue is full.
         self.queue.put(self._sentinel)
-
-    def stop(self):
-        super().stop()
-        self.report_drops(force=True)
 
 
 def start_queue_logging(capacity=1000, handlers=None):
@@ -146,10 +114,9 @@ def start_queue_logging(capacity=1000, handlers=None):
         handlers = owned + [h for h in previous if not isinstance(h, logging.NullHandler)]
     context = get_context("spawn")
     queue = context.Queue(maxsize=capacity)
-    dropped = context.Value("Q", 0)
-    handler = LogQueueHandler(queue, dropped)
-    listener = LogQueueListener(queue, dropped, *handlers)
-    runtime = {"queue": queue, "dropped": dropped, "listener": listener,
+    handler = LogQueueHandler(queue)
+    listener = LogQueueListener(queue, *handlers, respect_handler_level=True)
+    runtime = {"queue": queue, "listener": listener,
                "handler": handler, "previous": previous, "owned": owned}
     listener.start()
     logger.handlers = [handler]

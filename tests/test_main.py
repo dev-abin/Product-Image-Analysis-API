@@ -12,8 +12,10 @@ from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 
 import main
+import gemini_resources as gemini_module
 import validate_image as validation_module
 from schemas import ProductAnalysis
+from settings import Settings
 from request_logging import create_file_handler, logger, request_id_context
 from validation_pool import ValidationBusy
 from analyse_image import GeminiBusy
@@ -21,14 +23,9 @@ from analyse_image import GeminiBusy
 
 @pytest.fixture
 def gemini_resources(monkeypatch):
-    client = object()
-
-    @asynccontextmanager
-    async def shared_client(attempt_timeout):
-        yield client
-
-    monkeypatch.setattr(main, "shared_gemini_client", shared_client)
-    return {"client": client, "semaphore": asyncio.Semaphore(5)}
+    client = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setattr(gemini_module.genai, "Client", Mock(return_value=Mock(aio=client)))
+    return gemini_module.GeminiResources(Settings(), client)
 
 
 @pytest.fixture
@@ -60,7 +57,7 @@ def pipeline(monkeypatch, facts_data):
     })
     analysis = AsyncMock(return_value=ProductAnalysis(**facts_data))
     monkeypatch.setattr(validation_module, "validate_image", validation)
-    monkeypatch.setattr(main, "analyze_image", analysis)
+    monkeypatch.setattr(gemini_module, "analyze_image", analysis)
     return validation, analysis
 
 
@@ -122,8 +119,8 @@ def test_upload_final_decision(client, pipeline, facts_data, changes, status, re
         "status": status, "reasons": reasons, "scores": validation.return_value["scores"],
         "facts": facts.model_dump() if facts else None,
     }
-    assert analysis.await_args.args == (b"bytes", "image/png")
-    assert analysis.await_args.kwargs["client"] is not None
+    assert analysis.await_args.args == (b"bytes", "image/png", ANY, ANY)
+    assert analysis.await_args.args[2] is not None
 
 
 def test_missing_file_is_422(client, pipeline):
@@ -150,13 +147,13 @@ def test_upload_file_is_closed_even_on_error(pipeline, validation_service, gemin
             asyncio.run(main.upload_image(request_for(validation_service, gemini_resources), file))
     else:
         asyncio.run(main.upload_image(request_for(validation_service, gemini_resources), file))
-        assert pipeline[1].await_args.args == (b"bytes", "application/octet-stream")
+        assert pipeline[1].await_args.args == (b"bytes", "application/octet-stream", ANY, ANY)
     assert file.file.closed
 
 
 def test_real_invalid_image_skips_analysis(client, monkeypatch):
     analysis = Mock()
-    monkeypatch.setattr(main, "analyze_image", analysis)
+    monkeypatch.setattr(gemini_module, "analyze_image", analysis)
     response = client.post("/upload", files={"file": ("bad.png", b"invalid", "image/png")})
     assert response.json() == {"status": "fail", "reasons": ["invalid_image"],
                                "scores": {"min_side": None, "sharpness": None}, "facts": None}
@@ -226,7 +223,7 @@ def test_lifespan_configures_and_closes_pool(monkeypatch, validation_service, ge
     with TestClient(main.app) as client:
         assert client.get("/health").status_code == 200
         main.ValidationPool.assert_called_once_with(
-            workers=2, max_waiting=10, wait_timeout=1.5, log_queue=ANY, dropped=ANY,
+            workers=2, max_waiting=10, wait_timeout=1.5, log_queue=ANY,
         )
         validation_service.close.assert_not_awaited()
     validation_service.close.assert_awaited_once()
@@ -245,9 +242,9 @@ def test_lifespan_shares_gemini_limits(monkeypatch, validation_service, gemini_r
     monkeypatch.setenv("GEMINI_REQUESTS_PER_MINUTE", "60")
     with TestClient(main.app) as client:
         state = client.app.app.state.gemini
-        assert state["semaphore"]._value == 2
-        assert state["admission"].maxsize == 5
-        assert state["pacing"]["interval"] == 1
+        assert state.semaphore._value == 2
+        assert state.admission.maxsize == 5
+        assert state.pacing["interval"] == 1
 
 
 @pytest.mark.parametrize("key,value", [
@@ -255,9 +252,85 @@ def test_lifespan_shares_gemini_limits(monkeypatch, validation_service, gemini_r
     ("GEMINI_REQUESTS_PER_MINUTE", "nan"), ("GEMINI_TOTAL_TIMEOUT", "0"),
     ("GEMINI_RETRY_BACKOFF", "-1"),
 ])
-def test_invalid_gemini_config_closes_validation_pool(monkeypatch, validation_service, key, value):
+def test_invalid_config_is_rejected_before_allocating_resources(monkeypatch, validation_service, key, value):
     monkeypatch.setenv(key, value)
-    with pytest.raises(ValueError, match="Gemini configuration"):
+    with pytest.raises(ValueError, match=key):
+        with TestClient(main.app):
+            pass
+    main.ValidationPool.assert_not_called()
+    validation_service.close.assert_not_awaited()
+
+
+def test_gemini_startup_failure_closes_validation_pool(monkeypatch, validation_service, gemini_resources):
+    monkeypatch.setattr(gemini_module, "GeminiResources", Mock(side_effect=RuntimeError("startup failed")))
+    with pytest.raises(RuntimeError, match="startup failed"):
         with TestClient(main.app):
             pass
     validation_service.close.assert_awaited_once()
+
+
+def test_validation_pool_startup_failure_stops_application_logging(monkeypatch, validation_service):
+    runtime = {"queue": Mock()}
+    stop = Mock()
+    monkeypatch.setattr(main, "start_queue_logging", Mock(return_value=runtime))
+    monkeypatch.setattr(main, "stop_queue_logging", stop)
+    main.ValidationPool.side_effect = RuntimeError("executor initialization failed")
+
+    with pytest.raises(RuntimeError, match="executor initialization failed"):
+        with TestClient(main.app):
+            pass
+    stop.assert_called_once_with(runtime)
+
+
+@pytest.mark.parametrize("pool_close_fails", [False, True])
+def test_lifespan_cleanup_order_and_logging_survives_pool_close_failure(
+    monkeypatch, validation_service, pool_close_fails,
+):
+    events = []
+    runtime = {"queue": Mock()}
+
+    def start_logging(**kwargs):
+        events.append("logging.started")
+        return runtime
+
+    def create_pool(**kwargs):
+        events.append("pool.created")
+        return validation_service
+
+    @asynccontextmanager
+    async def managed_gemini(settings):
+        events.append("gemini.started")
+        try:
+            yield object()
+        finally:
+            events.append("gemini.closed")
+
+    async def close_pool():
+        events.append("pool.closed")
+        if pool_close_fails:
+            raise RuntimeError("pool close failed")
+
+    def stop_logging(received_runtime):
+        assert received_runtime is runtime
+        events.append("logging.stopped")
+
+    monkeypatch.setattr(main, "start_queue_logging", start_logging)
+    monkeypatch.setattr(main, "stop_queue_logging", stop_logging)
+    main.ValidationPool.side_effect = create_pool
+    monkeypatch.setattr(main, "gemini_resources", managed_gemini)
+    validation_service.close.side_effect = close_pool
+
+    async def run():
+        api = SimpleNamespace(state=SimpleNamespace())
+        async with main.lifespan(api):
+            assert events == ["logging.started", "pool.created", "gemini.started"]
+
+    if pool_close_fails:
+        with pytest.raises(RuntimeError, match="pool close failed"):
+            asyncio.run(run())
+    else:
+        asyncio.run(run())
+    assert events == [
+        "logging.started", "pool.created", "gemini.started",
+        "gemini.closed", "pool.closed", "logging.stopped",
+    ]

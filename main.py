@@ -1,62 +1,39 @@
 import asyncio
-import math
-import os
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 
-from analyse_image import GeminiBusy, analyze_image, shared_gemini_client
+from analyse_image import GeminiBusy
+from gemini_resources import gemini_resources
 from request_logging import (
     RequestLoggingMiddleware, logger, request_id_context, start_queue_logging, stop_queue_logging,
 )
 from schemas import ProductAnalysis, UploadResponse
+from settings import Settings
 from validation_pool import ValidationBusy, ValidationPool
 
 
 @asynccontextmanager
-async def application_lifespan(api: FastAPI, log_runtime):
-    pool = ValidationPool(
-        workers=int(os.getenv("VALIDATION_WORKERS", str(min(4, os.cpu_count() or 1)))),
-        max_waiting=int(os.getenv("VALIDATION_MAX_WAITING", "96")),
-        wait_timeout=float(os.getenv("VALIDATION_WAIT_TIMEOUT", "3")),
-        log_queue=log_runtime["queue"], dropped=log_runtime["dropped"],
-    )
-    api.state.validation_pool = pool
-    try:
-        concurrent = int(os.getenv("GEMINI_MAX_CONCURRENT", "5"))
-        waiting = int(os.getenv("GEMINI_MAX_WAITING", "20"))
-        rpm = float(os.getenv("GEMINI_REQUESTS_PER_MINUTE", "0"))
-        options = {
-            "queue_timeout": float(os.getenv("GEMINI_QUEUE_TIMEOUT", "3")),
-            "total_timeout": float(os.getenv("GEMINI_TOTAL_TIMEOUT", "30")),
-            "attempt_timeout": float(os.getenv("GEMINI_ATTEMPT_TIMEOUT", "10")),
-            "retry_backoff": float(os.getenv("GEMINI_RETRY_BACKOFF", "0.5")),
-        }
-        if (concurrent < 1 or waiting < 0 or not math.isfinite(rpm) or rpm < 0
-                or any(not math.isfinite(v) or v <= 0 for k, v in options.items() if k != "retry_backoff")
-                or not math.isfinite(options["retry_backoff"]) or options["retry_backoff"] < 0):
-            raise ValueError("Invalid Gemini configuration")
-        async with shared_gemini_client(options["attempt_timeout"]) as client:
-            api.state.gemini = {
-                **options, "client": client,
-                "model": os.getenv("GEMINI_MODEL", "gemini-flash-latest"),
-                "semaphore": asyncio.Semaphore(concurrent),
-                "admission": asyncio.Queue(maxsize=concurrent + waiting),
-                "pacing": {"lock": asyncio.Lock(), "next_at": 0.0, "interval": 60 / rpm} if rpm else None,
-            }
-            yield
-    finally:
-        await pool.close()
-
-
-@asynccontextmanager
 async def lifespan(api: FastAPI):
-    runtime = start_queue_logging(capacity=int(os.getenv("LOG_QUEUE_CAPACITY", "1000")))
+    settings = Settings.from_env()
+    api.state.settings = settings
+    runtime = start_queue_logging(capacity=settings.log_queue_capacity)
     api.state.log_runtime = runtime
     try:
-        async with application_lifespan(api, runtime):
-            yield
+        pool = ValidationPool(
+            workers=settings.validation_workers,
+            max_waiting=settings.validation_max_waiting,
+            wait_timeout=settings.validation_wait_timeout,
+            log_queue=runtime["queue"],
+        )
+        api.state.validation_pool = pool
+        try:
+            async with gemini_resources(settings) as gemini:
+                api.state.gemini = gemini
+                yield
+        finally:
+            await pool.close()
     finally:
         await asyncio.to_thread(stop_queue_logging, runtime)
 
@@ -105,10 +82,9 @@ async def upload_image(
             })
             return {**validation, "facts": None}
 
-        facts = await analyze_image(
+        facts = await request.app.state.gemini.analyze(
             image_bytes,
             file.content_type or "application/octet-stream",
-            **request.app.state.gemini,
         )
 
         decision = decide(facts)

@@ -8,7 +8,9 @@ import pytest
 from google.genai import errors
 
 import analyse_image as module
+import gemini_resources as resources
 from schemas import ProductAnalysis
+from settings import Settings
 
 
 @pytest.fixture
@@ -16,13 +18,14 @@ def provider(monkeypatch, facts_data):
     generate = AsyncMock(return_value=SimpleNamespace(text=json.dumps(facts_data)))
     client = SimpleNamespace(models=SimpleNamespace(generate_content=generate), aclose=AsyncMock())
     factory = Mock(return_value=Mock(aio=client))
-    monkeypatch.setattr(module.genai, "Client", factory)
+    monkeypatch.setattr(resources.genai, "Client", factory)
     return factory, generate
 
 
 def analyze(payload, mime, **options):
     async def run():
-        async with module.shared_gemini_client() as client:
+        async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
+            client = shared.client
             return await module.analyze_image(
                 payload, mime, client, asyncio.Semaphore(5), retry_backoff=0, **options,
             )
@@ -166,7 +169,8 @@ def test_invalid_output_log_identifies_validation_stage(monkeypatch, provider):
 
 def test_client_is_reused_for_multiple_images(provider):
     async def run():
-        async with module.shared_gemini_client() as client:
+        async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
+            client = shared.client
             semaphore = asyncio.Semaphore(5)
             for _ in range(2):
                 assert await module.analyze_image(b"image", "image/png", client, semaphore) is not None
@@ -187,7 +191,8 @@ def test_concurrency_queue_bound_and_cancellation(provider, facts_data):
 
         provider[1].side_effect = blocked
         semaphore, admission = asyncio.Semaphore(1), asyncio.Queue(maxsize=2)
-        async with module.shared_gemini_client() as client:
+        async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
+            client = shared.client
             def call():
                 return module.analyze_image(b"image", "image/png", client, semaphore,
                                             admission=admission, retry_backoff=0)
@@ -212,7 +217,8 @@ def test_concurrency_queue_bound_and_cancellation(provider, facts_data):
 
 def test_queue_wait_deadline_returns_busy_without_provider_call(provider):
     async def run():
-        async with module.shared_gemini_client() as client:
+        async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
+            client = shared.client
             admission = asyncio.Queue(maxsize=1)
             with pytest.raises(module.GeminiBusy):
                 await module.analyze_image(b"image", "image/png", client, asyncio.Semaphore(0),
@@ -241,7 +247,8 @@ def test_deadlines_cover_attempts_backoff_and_pacing(provider, mode):
         if mode == "rate_wait":
             options["pacing"] = {"lock": asyncio.Lock(), "interval": 1,
                                   "next_at": asyncio.get_running_loop().time() + 100}
-        async with module.shared_gemini_client() as client:
+        async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
+            client = shared.client
             call = module.analyze_image(b"image", "image/png", client, semaphore,
                                         admission=admission, **options)
             if mode == "rate_wait":
@@ -263,7 +270,8 @@ def test_cancelling_active_call_releases_capacity(provider):
             await asyncio.Event().wait()
         provider[1].side_effect = blocked
         semaphore, admission = asyncio.Semaphore(1), asyncio.Queue(maxsize=1)
-        async with module.shared_gemini_client() as client:
+        async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
+            client = shared.client
             task = asyncio.create_task(module.analyze_image(
                 b"image", "image/png", client, semaphore, admission=admission,
             ))

@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pytest
 from PIL import Image
 
-import analyse_image
+import gemini_resources
 
 
 @pytest.fixture(autouse=True)
@@ -12,7 +12,7 @@ def block_real_gemini(monkeypatch):
     """Never use local credentials or contact Gemini during a test."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(
-        analyse_image.genai, "Client",
+        gemini_resources.genai, "Client",
         Mock(side_effect=AssertionError("Unexpected Gemini client creation")),
     )
 

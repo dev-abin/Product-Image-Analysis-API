@@ -1,23 +1,15 @@
 import asyncio
 import math
-import os
 import random
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from time import perf_counter
 
 import httpx
-from dotenv import load_dotenv
-from google import genai
 from google.genai import errors, types
 
 from request_logging import logger
 from schemas import ProductAnalysis
-
-
-load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 PROMPT = """
@@ -50,37 +42,11 @@ class GeminiBusy(Exception):
     """No analysis could be started within the admission budget."""
 
 
-@asynccontextmanager
-async def shared_gemini_client(attempt_timeout=10.0):
-    """Create once at startup; close both SDK transports at shutdown."""
-    owner = client = None
-    try:
-        key = os.getenv("GEMINI_API_KEY")
-        if not key:
-            raise ValueError("missing_api_key")
-        owner = genai.Client(api_key=key, http_options=types.HttpOptions(
-            timeout=max(1, int(attempt_timeout * 1000)),
-            retry_options=types.HttpRetryOptions(attempts=1),
-        ))
-        client = owner.aio
-    except Exception as exc:
-        logger.warning("llm.error", extra={
-            "stage": "provider_initialization", "error_type": type(exc).__name__,
-        })
-    try:
-        yield client
-    finally:
-        try:
-            if client is not None:
-                await client.aclose()
-        except Exception as exc:
-            logger.warning("llm.cleanup_error", extra={"error_type": type(exc).__name__})
-        finally:
-            if owner is not None:
-                try:
-                    await asyncio.to_thread(owner.close)
-                except Exception as exc:
-                    logger.warning("llm.cleanup_error", extra={"error_type": type(exc).__name__})
+def is_retryable_error(error: Exception) -> bool:
+    """Retry transport failures, attempt timeouts, and selected API statuses."""
+    if isinstance(error, errors.APIError):
+        return error.code in {408, 429, 500, 502, 503, 504}
+    return isinstance(error, (TimeoutError, httpx.TransportError))
 
 
 async def pace_request(pacing):
@@ -157,8 +123,7 @@ async def analyze_image(
                                     ),
                                 )
                         except (TimeoutError, httpx.TransportError, errors.APIError) as exc:
-                            transient = not isinstance(exc, errors.APIError) or exc.code in {408, 429, 500, 502, 503, 504}
-                            if attempt or not transient:
+                            if attempt > 0 or not is_retryable_error(exc):
                                 raise
                             logger.warning("llm.retry", extra={
                                 "stage": stage, "attempt": attempt + 1, "error_type": type(exc).__name__,
