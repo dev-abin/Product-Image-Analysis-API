@@ -18,7 +18,7 @@ class Settings(BaseModel):
     log_queue_capacity: int = Field(default=1000, ge=1, alias="LOG_QUEUE_CAPACITY")
 
     gemini_api_key: SecretStr | None = Field(default=None, repr=False, alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-flash-latest", alias="GEMINI_MODEL")
+    gemini_model: str = Field(alias="GEMINI_MODEL", min_length=1, pattern=r"\S")
     gemini_max_concurrent: int = Field(default=5, ge=1, alias="GEMINI_MAX_CONCURRENT")
     gemini_max_waiting: int = Field(default=20, ge=0, alias="GEMINI_MAX_WAITING")
     gemini_requests_per_minute: float = Field(default=0.0, ge=0, alias="GEMINI_REQUESTS_PER_MINUTE")

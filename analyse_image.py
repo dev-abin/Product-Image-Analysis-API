@@ -82,7 +82,7 @@ async def analyze_image(
     image_bytes: bytes, mime_type: str, client, semaphore: asyncio.Semaphore, *,
     admission: asyncio.Queue | None = None, pacing=None, queue_timeout=3.0,
     total_timeout=30.0, attempt_timeout=10.0, retry_backoff=0.5,
-    model="gemini-flash-latest",
+    model: str,
 ) -> ProductAnalysis | None:
     """Await Gemini under a shared semaphore; return None for analysis errors."""
     if client is None:

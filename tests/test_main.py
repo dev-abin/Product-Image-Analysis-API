@@ -25,7 +25,7 @@ from analyse_image import GeminiBusy
 def gemini_resources(monkeypatch):
     client = SimpleNamespace(aclose=AsyncMock())
     monkeypatch.setattr(gemini_module.genai, "Client", Mock(return_value=Mock(aio=client)))
-    return gemini_module.GeminiResources(Settings(), client)
+    return gemini_module.GeminiResources(Settings(gemini_model="test-model"), client)
 
 
 @pytest.fixture

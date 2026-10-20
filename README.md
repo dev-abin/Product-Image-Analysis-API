@@ -16,7 +16,7 @@ python -m venv .venv
 Copy-Item .env_example .env
 ```
 
-Set `GEMINI_API_KEY` in `.env`, then start the development server:
+Set `GEMINI_API_KEY` and `GEMINI_MODEL` in `.env`, then start the development server:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn main:app --reload --no-access-log

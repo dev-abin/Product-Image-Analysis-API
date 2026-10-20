@@ -60,7 +60,7 @@ def test_resource_setup_failure_still_closes_both_transports(monkeypatch):
     monkeypatch.setattr(module, "GeminiResources", Mock(side_effect=RuntimeError("setup failed")))
 
     async def run():
-        async with module.gemini_resources(Settings(gemini_api_key="test-key")):
+        async with module.gemini_resources(Settings(gemini_api_key="test-key", gemini_model="test-model")):
             pytest.fail("Failed resource setup must not enter the context body")
 
     with pytest.raises(RuntimeError, match="setup failed"):
@@ -70,4 +70,4 @@ def test_resource_setup_failure_still_closes_both_transports(monkeypatch):
 
 
 def test_pacing_is_disabled_by_default():
-    assert module.GeminiResources(Settings(), client=None).pacing is None
+    assert module.GeminiResources(Settings(gemini_model="test-model"), client=None).pacing is None

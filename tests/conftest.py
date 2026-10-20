@@ -11,6 +11,7 @@ import gemini_resources
 def block_real_gemini(monkeypatch):
     """Never use local credentials or contact Gemini during a test."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MODEL", "test-model")
     monkeypatch.setattr(
         gemini_resources.genai, "Client",
         Mock(side_effect=AssertionError("Unexpected Gemini client creation")),

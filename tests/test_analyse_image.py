@@ -27,7 +27,8 @@ def analyze(payload, mime, **options):
         async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
             client = shared.client
             return await module.analyze_image(
-                payload, mime, client, asyncio.Semaphore(5), retry_backoff=0, **options,
+                payload, mime, client, asyncio.Semaphore(5),
+                model=shared.settings.gemini_model, retry_backoff=0, **options,
             )
     return asyncio.run(run())
 
@@ -42,6 +43,7 @@ def test_success_uses_image_schema_and_timeout(provider, facts_data):
     assert factory.call_args.kwargs["api_key"] == "test-key"
     generate.assert_awaited_once()
     request = generate.call_args.kwargs
+    assert request["model"] == "test-model"
     assert request["contents"][0] == module.PROMPT
     assert request["contents"][1].inline_data.data == b"image-bytes"
     assert request["contents"][1].inline_data.mime_type == "image/png"
@@ -173,7 +175,9 @@ def test_client_is_reused_for_multiple_images(provider):
             client = shared.client
             semaphore = asyncio.Semaphore(5)
             for _ in range(2):
-                assert await module.analyze_image(b"image", "image/png", client, semaphore) is not None
+                assert await module.analyze_image(
+                    b"image", "image/png", client, semaphore, model=shared.settings.gemini_model,
+                ) is not None
     asyncio.run(run())
     provider[0].assert_called_once()
     assert provider[1].await_count == 2
@@ -195,6 +199,7 @@ def test_concurrency_queue_bound_and_cancellation(provider, facts_data):
             client = shared.client
             def call():
                 return module.analyze_image(b"image", "image/png", client, semaphore,
+                                            model=shared.settings.gemini_model,
                                             admission=admission, retry_backoff=0)
             first = asyncio.create_task(call())
             await asyncio.wait_for(entered.wait(), timeout=1)
@@ -222,6 +227,7 @@ def test_queue_wait_deadline_returns_busy_without_provider_call(provider):
             admission = asyncio.Queue(maxsize=1)
             with pytest.raises(module.GeminiBusy):
                 await module.analyze_image(b"image", "image/png", client, asyncio.Semaphore(0),
+                                           model=shared.settings.gemini_model,
                                            admission=admission, queue_timeout=0.01)
             assert admission.empty()
     asyncio.run(run())
@@ -250,6 +256,7 @@ def test_deadlines_cover_attempts_backoff_and_pacing(provider, mode):
         async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
             client = shared.client
             call = module.analyze_image(b"image", "image/png", client, semaphore,
+                                        model=shared.settings.gemini_model,
                                         admission=admission, **options)
             if mode == "rate_wait":
                 with pytest.raises(module.GeminiBusy):
@@ -273,7 +280,8 @@ def test_cancelling_active_call_releases_capacity(provider):
         async with resources.gemini_resources(Settings.from_env(env_file=None)) as shared:
             client = shared.client
             task = asyncio.create_task(module.analyze_image(
-                b"image", "image/png", client, semaphore, admission=admission,
+                b"image", "image/png", client, semaphore,
+                model=shared.settings.gemini_model, admission=admission,
             ))
             await asyncio.wait_for(entered.wait(), timeout=1)
             task.cancel()
